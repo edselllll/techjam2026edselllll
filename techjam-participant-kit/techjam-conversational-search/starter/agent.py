@@ -1,24 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
 import re
-import json
-import numpy as np
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
 
-hf_token = os.getenv("HF_TOKEN", "").strip()
+hf_token = os.getenv("HF_TOKEN", "").strip() or os.getenv("HUGGINGFACE_HUB_TOKEN", "").strip()
 if hf_token:
     os.environ["HF_TOKEN"] = hf_token
     os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
 from sentence_transformers import SentenceTransformer
 from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
-
+from starter.state_tracker import DialogueStateTracker  # Import dialogue state tracker
 
 # Allowed attributes defined by the evaluator
 ALLOWED_ATTRIBUTES = {
@@ -72,6 +73,7 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self.parent_asins: List[str] = []
+        self.state_tracker = DialogueStateTracker()
 
         # 1. Load Model Encoder
         self.encoder = SentenceTransformer(
@@ -113,7 +115,6 @@ class Agent:
                 self.parent_asins.append(asin)
                 bm25_batch.append((asin, title, cats, feats, dets, store, desc))
                 
-                # Compose text document for dense vector embedding
                 embed_text = f"{title}. Category: {cats}. Features: {feats}".strip()
                 documents_to_embed.append(embed_text)
 
@@ -125,14 +126,10 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", bm25_batch)
         self.connection.commit()
 
-    def reset(self, session_id: str, user_profile: dict) -> None:
-        """Resets session context for a new evaluation run."""
-        self._sessions[session_id] = {
-            "history": [],
-            "slots": {},
-            "profile": user_profile or {}
-        }
-
+    def reset(self, session_id: str, user_profile: Optional[dict] = None) -> None:
+        """Resets agent state per session and loads user profile preferences."""
+        self.state_tracker.reset(user_profile)
+        
     def _detect_intent(self, user_message: str, active_slots: Dict[str, Any]) -> str:
         text = user_message.lower()
         detected_attributes = len(active_slots)
@@ -167,7 +164,6 @@ class Agent:
             return []
         expression = " OR ".join(f'"{t}"' for t in terms)
         
-        # Select parent_asin and BM25 rank score
         rows = self.connection.execute(
             "SELECT parent_asin, bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) AS score "
             "FROM products WHERE products MATCH ? "
@@ -175,8 +171,6 @@ class Agent:
             (expression, top_k),
         ).fetchall()
 
-        # SQLite FTS5 bm25() returns negative values (lower is better match),
-        # so we negate it (-r[1]) so higher scores represent better matches.
         return [(str(r[0]), -float(r[1])) for r in rows]
 
     def _min_max_scale(self, scores_dict: Dict[str, float]) -> Dict[str, float]:
@@ -199,7 +193,6 @@ class Agent:
         bm25_dict = dict(bm25_results)
         faiss_dict = dict(faiss_results)
 
-        # 1. Normalize scores independently to [0, 1]
         norm_bm25 = self._min_max_scale(bm25_dict)
         norm_faiss = self._min_max_scale(faiss_dict)
 
@@ -207,7 +200,6 @@ class Agent:
         all_asins = set(bm25_dict.keys()) | set(faiss_dict.keys())
         combmnz_scores: Dict[str, float] = {}
 
-        # 2. Compute CombSUM & multiply by match count (N_retrievers)
         for asin in all_asins:
             matches_count = 0
             comb_sum = 0.0
@@ -220,10 +212,8 @@ class Agent:
                 matches_count += 1
                 comb_sum += w_faiss * norm_faiss[asin]
 
-            # CombMNZ = CombSUM * N_retrievers
             combmnz_scores[asin] = comb_sum * matches_count
 
-        # 3. Sort candidates by final score descending
         sorted_candidates = sorted(
             combmnz_scores.items(), 
             key=lambda item: item[1], 
@@ -231,57 +221,55 @@ class Agent:
         )
         return [asin for asin, _ in sorted_candidates]
 
-    def _select_ask_attribute(self, user_message: str, active_slots: Dict[str, Any]) -> str | None:
-        """Selects an unfulfilled attribute to ask the user to clarify."""
-        text = user_message.lower()
-        attribute_priority = ["color", "size", "material", "brand", "style", "use_case", "category"]
+    def _execute_hybrid_search(self, query: str, top_k: int = 10) -> List[str]:
+        """Executes BM25 and FAISS vector retrieval and fuses results using CombMNZ."""
+        candidate_pool_size = max(top_k * 5, 50)
         
-        for attr in attribute_priority:
-            if attr not in text and attr not in active_slots:
-                if attr in ALLOWED_ATTRIBUTES:
-                    return attr
-        return "other" if "other" in ALLOWED_ATTRIBUTES else None
-
-    def respond(
-        self,
-        session_id: str,
-        user_message: str,
-        turn: int,
-        top_k: int,
-    ) -> dict:
-        session = self._sessions[session_id]
-        session["history"].append(user_message)
-        combined_query = " ".join(session["history"])
+        # 1. Sparse BM25 Search
+        bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         
-        # 1. Detect Intent Track using session slots dictionary
-        intent_track = self._detect_intent(user_message, session["slots"])
-
-        # 2. Multi-Route Candidate Retrieval (Top-100 each for candidate overlap)
-        bm25_candidates = self._search_bm25(combined_query, top_k=100)
-        faiss_candidates = self.vector_indexer.search(combined_query, top_k=100)
-
-        # 3. Dynamic CombMNZ Weighting
-        # Fusion weights = (BM25 weight, FAISS weight)
-        if intent_track == "Buying":
-            # Keyword precision prioritized
-            fusion_weights = (2.5, 1.0) 
-        else:
-            # Semantic scenario similarity prioritized
-            fusion_weights = (0.5, 2.0)
-
-        # 4. Fuse Candidate Pools using CombMNZ
+        # 2. Dense FAISS Vector Search
+        faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
+        
+        # 3. CombMNZ Fusion Reranking
         fused_asins = self._combmnz_fusion(
-            bm25_candidates, 
-            faiss_candidates, 
-            weights=fusion_weights
-        )[:top_k]
+            bm25_results=bm25_results,
+            faiss_results=faiss_results,
+            weights=(1.0, 1.0)
+        )
+        
+        # Return top_k candidate parent_asin strings
+        return fused_asins[:top_k]
 
-        recommendations = [{"parent_asin": asin} for asin in fused_asins]
-        ask_attr = self._select_ask_attribute(user_message, session["slots"])
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
+        """
+        Handles dialogue turn:
+        1. Updates slot state (Regex on happy path, 8B LLM on pivot triggers).
+        2. Determines the next attribute to ask (populates ask_attribute).
+        3. Formulates an updated search query from active slots.
+        4. Returns recommendations, clarifying message, and usage stats.
+        """
+        # 1. Update slots via DialogueStateTracker
+        active_slots = self.state_tracker.update_state(user_message, turn)
 
+        # 2. Select next unasked attribute for evaluator clarification loop
+        ask_attr = self.state_tracker.get_next_ask_attribute()
+
+        # 3. Construct flattened search query using category & slots
+        category_list = active_slots.get("category", [])
+        category = category_list[0] if category_list else ""
+        search_query = self.state_tracker.build_search_query(category) if category else user_message
+
+        # 4. Fetch recommendations immediately to maximize Hit@10 / early-turn conversion
+        recommendations = self._execute_hybrid_search(search_query, top_k)
+
+        # 5. Build standard response dictionary expected by local_evaluator.py
         return {
-            "message": f"Retrieved top matches using {intent_track} CombMNZ track.",
+            "message": f"Got it. What are your preferences for {ask_attr}?",
             "ask_attribute": ask_attr,
             "recommendations": recommendations,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": {
+                "prompt_tokens": 0,      # Populate if LLM override was triggered
+                "completion_tokens": 0,
+            },
         }
