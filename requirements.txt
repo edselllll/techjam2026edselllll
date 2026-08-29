@@ -1,0 +1,10 @@
+# Core Dependencies
+numpy>=1.26.0
+sentence-transformers
+transformers
+huggingface_hub
+datasets
+faiss-cpu
+torch>=2.5.0
+# Explicit Python version requirement (typically enforced via pyproject.toml or runtime checks)
+# Python == 3.12.3
