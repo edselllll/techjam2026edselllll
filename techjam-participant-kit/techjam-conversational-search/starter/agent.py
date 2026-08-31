@@ -311,10 +311,14 @@ class Agent:
 
         # 6. Select next unasked attribute for evaluator clarification loop
         ask_attr = self.state_tracker.get_next_ask_attribute()
+        if ask_attr:
+            message = f"Got it. What are your preferences for {ask_attr}?"
+        else:
+            message = "Got it. These are my best matches based on your preferences."
 
         # 7. Return payload expected by evaluator
         return {
-            "message": f"Got it. What are your preferences for {ask_attr}?",
+            "message": message,
             "ask_attribute": ask_attr,
             "recommendations": recommendations,
             "usage": {
