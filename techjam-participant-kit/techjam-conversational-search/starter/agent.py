@@ -53,6 +53,13 @@ def _terms(text: str) -> list[str]:
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
 
+def _parse_budget(values: List[str]) -> Optional[float]:
+    for value in values:
+        match = re.search(r"\$?\s*(\d+(?:\.\d+)?)", str(value))
+        if match:
+            return float(match.group(1))
+    return None
+
 def _normalize_category(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^a-z0-9\s-]", " ", text)
@@ -77,6 +84,9 @@ class Agent:
         # for profile reading 
         self.user_profile: Dict[str, Any] = {}
         self.profile_terms: set[str] = set()
+
+        self.term_document_frequency: Dict[str, int] = {}
+        self.catalog_size = 0
 
         # 1. Load Model Encoder
         self.encoder = SentenceTransformer(
@@ -120,6 +130,24 @@ class Agent:
                 details = _clean_text(product.get("details"))
                 description = _clean_text(product.get("description"))
                 store = _clean_text(product.get("store"))
+
+                document_terms = set(_terms(
+                    " ".join([
+                        title,
+                        cats,
+                        feats,
+                        details,
+                        store,
+                        description,
+                    ])
+                ))
+
+                for term in document_terms:
+                    self.term_document_frequency[term] = (
+                        self.term_document_frequency.get(term, 0) + 1
+                    )
+
+                self.catalog_size += 1
 
                 self.parent_asins.append(asin)
                 bm25_batch.append((asin, title, cats, feats, details, store, description))
@@ -326,6 +354,86 @@ class Agent:
 
         return candidates
 
+    def _idf(self, term: str) -> float:
+        """Smoothed inverse document frequency over the product catalog."""
+        df = self.term_document_frequency.get(term, 0)
+
+        return float(
+            np.log((self.catalog_size + 1) / (df + 1)) + 1.0
+        )
+
+
+    def _idf_coverage(
+        self,
+        query_terms: set[str],
+        product_terms: set[str],
+    ) -> float:
+        """Coverage weighted toward rare, discriminative query terms."""
+        if not query_terms:
+            return 0.0
+
+        total_weight = sum(self._idf(term) for term in query_terms)
+        if total_weight <= 0:
+            return 0.0
+
+        matched_weight = sum(
+            self._idf(term)
+            for term in query_terms
+            if term in product_terms
+        )
+
+        return matched_weight / total_weight
+    
+    def _structured_constraint_score(
+        self,
+        product: Dict[str, Any],
+        active_slots: Dict[str, List[str]],
+    ) -> float:
+        """
+        Measures satisfaction of explicit structured shopping constraints.
+        Missing catalog metadata is treated neutrally rather than as failure.
+        """
+        scores = []
+
+        # Numeric budget constraint
+        budget = _parse_budget(active_slots.get("budget", []))
+        price = product.get("price")
+
+        if budget is not None and price is not None:
+            try:
+                price = float(price)
+
+                if price <= budget:
+                    scores.append(1.0)
+                elif price <= budget * 1.10:
+                    scores.append(0.4)
+                else:
+                    scores.append(0.0)
+            except (TypeError, ValueError):
+                pass
+
+        # Explicit categorical/text constraints
+        product_text = " ".join([
+            _clean_text(product.get("title")),
+            _clean_text(product.get("categories")),
+            _clean_text(product.get("features")),
+            _clean_text(product.get("details")),
+            _clean_text(product.get("store")),
+        ]).lower()
+
+        for slot in ("material", "color", "size", "brand"):
+            values = active_slots.get(slot, [])
+            if not values:
+                continue
+
+            matched = any(
+                value.lower() in product_text
+                for value in values
+            )
+
+            scores.append(1.0 if matched else 0.0)
+
+        return sum(scores) / len(scores) if scores else 0.0
 
     def _field_terms(self, product: dict, field: str) -> set[str]:
         return set(_terms(_clean_text(product.get(field))))
@@ -356,6 +464,11 @@ class Agent:
         for asin in candidates:
             product = self.products_by_asin.get(asin, {})
 
+            structured_constraint_score = self._structured_constraint_score(
+                product,
+                self.state_tracker.active_slots,
+            )
+
             title_terms = self._field_terms(product, "title")
             category_terms = self._field_terms(product, "categories")
             feature_terms = self._field_terms(product, "features")
@@ -366,6 +479,12 @@ class Agent:
             all_terms = (
                 title_terms | category_terms | feature_terms |
                 detail_terms | description_terms | store_terms
+            )
+
+            # Compute IDF coverage metrics for query terms
+            idf_coverage = self._idf_coverage(
+                query_terms,
+                all_terms,
             )
 
             ## Compute coverage metrics for profile terms
@@ -435,6 +554,8 @@ class Agent:
                     + 0.15 * both_bonus
                     + 0.08 * profile_coverage + 0.06 * profile_feature_coverage + 0.04 * profile_title_coverage
                     + 0.30 * category_hierarchy_score
+                    + 0.35 * structured_constraint_score
+                    + 0.30 * idf_coverage
                 )
             else:
                 score = (
@@ -446,6 +567,8 @@ class Agent:
                     + 0.15 * both_bonus
                     + 0.12 * profile_coverage + 0.08 * profile_feature_coverage + 0.05 * profile_title_coverage
                     + 0.18 * category_hierarchy_score
+                    + 0.12 * structured_constraint_score
+                    + 0.25 * idf_coverage
                 )
 
             scored.append((asin, score))
