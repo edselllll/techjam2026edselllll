@@ -659,18 +659,3 @@ conversation
 ```
 
 ---
-
-
-# Demo
-
-**YouTube:** `[DEMO VIDEO LINK]`
-
-The demo walks through the agent end-to-end, including multi-turn inference, intent routing, preference accumulation, proactive clarification, hybrid retrieval, and final recommendations.
-
----
-
-# Acknowledgements
-
-Built for **TikTok TechJam 2026 — Shopping Copilot: AI Conversational Search and Recommendations**.
-
-Product data is derived from the **Amazon Reviews 2023** dataset and distributed through the official TechJam competition kit.
