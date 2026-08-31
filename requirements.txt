@@ -1,10 +1,19 @@
-# Core Dependencies
-numpy>=1.26.0
-sentence-transformers
-transformers
-huggingface_hub
-datasets
-faiss-cpu
-torch>=2.5.0
-# Explicit Python version requirement (typically enforced via pyproject.toml or runtime checks)
-# Python == 3.12.3
+# Core numerical / ML stack
+numpy>=1.26
+scikit-learn>=1.4
+torch>=2.2
+
+# Hugging Face models and authentication
+huggingface_hub>=0.24
+sentence-transformers>=3.0
+transformers>=4.41
+
+# Vector retrieval
+faiss-cpu>=1.8
+
+# Utilities
+python-dotenv>=1.0
+tqdm>=4.66
+
+# Official evaluator / contract support
+jsonschema>=4.21
