@@ -20,6 +20,7 @@ from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
 from starter.indexer import _clean_text  # Import text cleaning utility
 from starter.state_tracker_rulebased import DialogueStateTracker  # Import rule-based dialogue state tracker
 from starter.clarification_policy import ClarificationPolicy
+from starter.orchestration import RetrievalOrchestrator
 
 # Allowed attributes defined by the evaluator
 ALLOWED_ATTRIBUTES = {
@@ -66,6 +67,7 @@ class Agent:
         self.products_by_asin: Dict[str, Dict[str, Any]] = {}
         self.state_tracker = DialogueStateTracker()
         self.clarification_policy = ClarificationPolicy()
+        self.retrieval_orchestrator = RetrievalOrchestrator()
         # for profile reading 
         self.user_profile: Dict[str, Any] = {}
         self.profile_terms: set[str] = set()
@@ -373,29 +375,84 @@ class Agent:
         scored.sort(key=lambda item: item[1], reverse=True)
         return [asin for asin, _ in scored]
 
-    def _buying_pipeline(self, query: str, top_k: int, rerank_query: str = "") -> Tuple[List[str],List[str],List[Tuple[str, float]],List[Tuple[str, float]],]:
+    def _buying_pipeline(
+        self,
+        query: str,
+        top_k: int,
+        rerank_query: str = "",
+        fusion_keep: int = 100,
+        bm25_keep: int = 150,
+        faiss_keep: int = 75,
+    ) -> Tuple[List[str], List[str], List[Tuple[str, float]], List[Tuple[str, float]]]:
+        # Keep first-stage retrieval fixed so normalization remains stable.
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
-        fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(2.5, 0.8),)
+        fused = self._combmnz_fusion(
+            bm25_results,
+            faiss_results,
+            weights=(2.5, 0.8),
+        )
 
-        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=100,bm25_k=150,faiss_k=75,)
+        # Only candidate preservation depth changes dynamically.
+        candidates = self._candidate_union(
+            fused,
+            bm25_results,
+            faiss_results,
+            fusion_k=fusion_keep,
+            bm25_k=bm25_keep,
+            faiss_k=faiss_keep,
+        )
 
-        reranked = self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results,intent="Buying",)
+        reranked = self._rerank_candidates(
+            rerank_query or query,
+            candidates,
+            bm25_results,
+            faiss_results,
+            intent="Buying",
+        )
 
         return reranked[:top_k], candidates, bm25_results, faiss_results
 
-    def _browsing_pipeline(self, query: str, top_k: int, rerank_query: str = "",) -> Tuple[List[str],List[str],List[Tuple[str, float]],List[Tuple[str, float]],]:
+    def _browsing_pipeline(
+        self,
+        query: str,
+        top_k: int,
+        rerank_query: str = "",
+        fusion_keep: int = 100,
+        bm25_keep: int = 150,
+        faiss_keep: int = 75,
+    ) -> Tuple[List[str], List[str], List[Tuple[str, float]], List[Tuple[str, float]]]:
+        # Keep first-stage retrieval fixed so normalization remains stable.
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
-        fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(1.4, 1.0),)
+        fused = self._combmnz_fusion(
+            bm25_results,
+            faiss_results,
+            weights=(1.4, 1.0),
+        )
 
-        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=100,bm25_k=150,faiss_k=75,)
+        # Only candidate preservation depth changes dynamically.
+        candidates = self._candidate_union(
+            fused,
+            bm25_results,
+            faiss_results,
+            fusion_k=fusion_keep,
+            bm25_k=bm25_keep,
+            faiss_k=faiss_keep,
+        )
 
-        reranked = self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results, intent="Browsing",)
+        reranked = self._rerank_candidates(
+            rerank_query or query,
+            candidates,
+            bm25_results,
+            faiss_results,
+            intent="Browsing",
+        )
+
         return reranked[:top_k], candidates, bm25_results, faiss_results
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
@@ -425,13 +482,39 @@ class Agent:
         else:
             search_query = user_message
 
-        # 4. Route candidate retrieval based on detected turn intent
-        rerank_query = slot_query if len(_terms(slot_query)) >= 2 else search_query
-        if intent == "Buying":
-            raw_recommendations, candidates, bm25_results, faiss_results = self._buying_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
-        else:
-            raw_recommendations, candidates, bm25_results, faiss_results = self._browsing_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
+        # 4. Runtime orchestration: adapt reranker candidate depth while keeping
+        # BM25/FAISS retrieval depth fixed for stable recall and normalization.
+        fusion_keep, bm25_keep, faiss_keep = (
+            self.retrieval_orchestrator.candidate_depth(
+                intent=intent,
+                active_slots=active_slots,
+            )
+        )
 
+        rerank_query = slot_query if len(_terms(slot_query)) >= 2 else search_query
+
+        if intent == "Buying":
+            raw_recommendations, candidates, bm25_results, faiss_results = (
+                self._buying_pipeline(
+                    search_query,
+                    top_k=top_k * 5,
+                    rerank_query=rerank_query,
+                    fusion_keep=fusion_keep,
+                    bm25_keep=bm25_keep,
+                    faiss_keep=faiss_keep,
+                )
+            )
+        else:
+            raw_recommendations, candidates, bm25_results, faiss_results = (
+                self._browsing_pipeline(
+                    search_query,
+                    top_k=top_k * 5,
+                    rerank_query=rerank_query,
+                    fusion_keep=fusion_keep,
+                    bm25_keep=bm25_keep,
+                    faiss_keep=faiss_keep,
+                )
+            )
         # 5. Strict order-preserving deduplication & catalog validation
         seen = set()
         recommendations = []
