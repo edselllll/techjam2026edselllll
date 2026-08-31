@@ -3,13 +3,25 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from huggingface_hub import InferenceClient
 
-# Constants aligned with local_evaluator.py
 ALLOWED_ATTRIBUTES = {
     "category", "material", "color", "size", "style", "brand",
     "budget", "feature", "use_case", "other",
+}
+
+# Semantic map connecting preference_tags -> priority slot attributes
+TAG_TO_ATTRIBUTE_MAP = {
+    "warmth": ["material", "use_case"],       # e.g., wool, fleece, winter
+    "weather": ["use_case", "material"],      # e.g., outdoor, rain, waterproof
+    "performance": ["use_case", "feature"],   # e.g., running, breathable
+    "durability": ["material", "brand"],      # e.g., leather, heavy-duty
+    "fit": ["size", "style"],                 # e.g., slim fit, medium
+    "style": ["style", "color", "brand"],     # e.g., casual, vintage
+    "comfort": ["material", "feature"],       # e.g., cotton, cushioned
+    "general shopping": ["category", "budget"],
+    "material": ["material"]
 }
 
 MATERIALS = r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric)\b"
@@ -18,7 +30,7 @@ SIZES = r"\b(small|medium|large|xlarge|x-large|xxl|xs|s|m|l|xl|size\s*\d+(\.\d+)
 STYLES = r"\b(casual|formal|vintage|modern|slim fit|regular fit|loose|athletic|boho|streetwear)\b"
 USE_CASES = r"\b(hiking|running|gym|winter|outdoor|work|party|travel|yoga|swimming|wedding)\b"
 
-ATTRIBUTE_PRIORITY = ["category", "color", "size", "material", "style", "use_case", "budget", "brand", "feature"]
+ATTRIBUTE_PRIORITY = ["category", "material", "color", "size", "style", "brand", "budget", "feature", "use_case", "other", None]
 
 SLOT_PATTERNS = {
     "budget": re.compile(r"(?:under|below|less than|budget(?: of)?|around|\$)\s*(\$?\d+(?:\.\d{2})?)", re.I),
@@ -30,29 +42,42 @@ SLOT_PATTERNS = {
 }
 
 PIVOT_TRIGGERS = re.compile(
-    r"\b(ignore|instead|actually|change|rather|never mind|different|switch|replace|scratch that)\b", re.I
+    r"\b(ignore|instead|actually|change|changed|rather|never mind|nevermind|different|switch|replace|scratch|no|not|dont|don't|forget|prefer|would like)\b", re.I
 )
 
 
 class DialogueStateTracker:
     def __init__(self, api_key: Optional[str] = None) -> None:
-        hf_token = api_key or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        hf_token = api_key or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
         self.llm_model = "meta-llama/Llama-3.1-8B-Instruct"
         self.client = InferenceClient(model=self.llm_model, api_key=hf_token) if hf_token else None
         
         self.active_slots: Dict[str, List[str]] = {}
         self.asked_attributes: Set[str] = set()
+        
+        # Cumulative session trackers for logging/debugging
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
 
     def reset(self, user_profile: Optional[dict] = None) -> None:
         """Resets dialogue state and seeds initial profile preferences."""
         self.active_slots = {}
         self.asked_attributes = set()
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
         
         if user_profile and isinstance(user_profile, dict):
-            # Seed non-conflicting default preferences if present
+            # Seed preference_tags if available in profile contract
+            pref_tags = user_profile.get("preference_tags", [])
+            if isinstance(pref_tags, list):
+                for tag in pref_tags:
+                    extracted = self.extract_slots_regex(str(tag))
+                    for k, v in extracted.items():
+                        self.active_slots[k] = v
+
             for key in ["size", "brand", "style"]:
                 val = user_profile.get(key)
-                if val:
+                if val and key not in self.active_slots:
                     self.active_slots[key] = [str(val).lower()]
 
     def extract_slots_regex(self, text: str) -> Dict[str, List[str]]:
@@ -72,61 +97,100 @@ class DialogueStateTracker:
                 
         return extracted
 
-    def _run_llm_override(self, user_message: str) -> Dict[str, List[str]]:
-        """Triggers the fast 8B LLM to resolve slot conflicts during intent pivots."""
+    def _run_llm_override(self, user_message: str) -> Tuple[Dict[str, List[str]], int, int]:
+        """Uses chat_completion for Novita API compatibility and captures turn token usage."""
         if not self.client:
-            return self.active_slots
+            return self.active_slots, 0, 0
 
-        prompt = f"""You are an intent override state updater for a shopping assistant.
-Update the current JSON slot state based on the user's latest message.
+        system_prompt = (
+            "You are a dialogue state tracking engine for an e-commerce assistant.\n"
+            "Your task is to update the JSON slot state after a user changes their mind or alters search constraints.\n\n"
+            "STRICT OVERRIDE RULES:\n"
+            "1. IDENTIFY CONTRADICTIONS: When a user provides a new preference for an existing slot category (e.g., color, material, category, size), DELETE the old value and REPLACE it entirely with the new value.\n"
+            "2. DELETE CANCELLED PREFERENCES: If the user says \"ignore X\", \"no X\", or \"forget X\", REMOVE the \"X\" key from the state completely.\n"
+            "3. DO NOT MERGE CONTRADICTORY SLOTS: Never keep both old and new values for the same attribute (e.g., if old color is \"black\" and user says \"actually red\", output MUST be \"color\": [\"red\"], NOT [\"black\", \"red\"]).\n"
+            "4. PRESERVE UNTOUCHED CONSTRAINTS: Keep existing slots ONLY if they do not conflict with the new request.\n"
+            "5. STRICT JSON OUTPUT: Output ONLY a valid JSON dictionary mapping allowed keys to arrays of string values.\n\n"
+            f"Allowed slot keys:\n{json.dumps(list(ALLOWED_ATTRIBUTES))}\n\n"
+            "--- EXAMPLE 1: Value Override ---\n"
+            "Current State: {\"category\": [\"jacket\"], \"color\": [\"black\"], \"material\": [\"leather\"]}\n"
+            "User Message: \"Actually, ignore the leather preference. What I need is synthetic fabric.\"\n"
+            "Output JSON:\n"
+            "{\"category\": [\"jacket\"], \"color\": [\"black\"], \"material\": [\"synthetic fabric\"]}\n\n"
+            "--- EXAMPLE 2: Category Pivot & Slot Deletion ---\n"
+            "Current State: {\"category\": [\"running shoes\"], \"brand\": [\"nike\"], \"size\": [\"10\"], \"color\": [\"blue\"]}\n"
+            "User Message: \"Instead of running shoes, I want hiking boots in brown.\"\n"
+            "Output JSON:\n"
+            "{\"category\": [\"hiking boots\"], \"brand\": [\"nike\"], \"size\": [\"10\"], \"color\": [\"brown\"]}\n\n"
+            "--- EXAMPLE 3: Explicit Cancellation ---\n"
+            "Current State: {\"category\": [\"dress\"], \"style\": [\"vintage\"], \"budget\": [\"under $50\"]}\n"
+            "User Message: \"Never mind the budget limit, show me modern styles instead.\"\n"
+            "Output JSON:\n"
+            "{\"category\": [\"dress\"], \"style\": [\"modern\"]}"
+        )
 
-RULES:
-1. If the user cancels/overrides a preference (e.g., "ignore black, want red"), REMOVE the old value and REPLACE it.
-2. Preserve unrelated active slots unless explicitly contradicted.
-3. Output ONLY a valid JSON object.
-
-Allowed slot keys: ["category", "material", "color", "size", "style", "brand", "budget", "feature", "use_case"]
-
-Current State: {json.dumps(self.active_slots)}
-User Message: "{user_message}"
-Output JSON:"""
+        user_content = (
+            f"--- CURRENT TASK ---\n"
+            f"Current State: {json.dumps(self.active_slots)}\n"
+            f"User Message: \"{user_message}\"\n"
+            f"Output JSON:"
+        )
 
         try:
-            response = self.client.text_generation(
-                prompt=prompt,
-                max_new_tokens=150,
+            response = self.client.chat_completion(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                max_tokens=150,
                 temperature=0.0,
-                stop_sequences=["}"]
+                response_format={"type": "json_object"}
             )
-            raw_json = response.strip()
-            if not raw_json.endswith("}"):
-                raw_json += "}"
             
+            p_tokens = getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0
+            c_tokens = getattr(response.usage, "completion_tokens", 0) if hasattr(response, "usage") else 0
+
+            self.total_prompt_tokens += p_tokens
+            self.total_completion_tokens += c_tokens
+
+            raw_json = response.choices[0].message.content.strip()
             parsed = json.loads(raw_json)
-            if isinstance(parsed, dict):
-                return {k: [str(v)] if isinstance(v, str) else v for k, v in parsed.items() if k in ALLOWED_ATTRIBUTES}
-        except Exception:
-            pass  # Fallback to current slots on API timeout or parse error
             
-        return self.active_slots
+            if isinstance(parsed, dict):
+                cleaned = {}
+                for k, v in parsed.items():
+                    if k in ALLOWED_ATTRIBUTES and v:
+                        cleaned[k] = [str(x).lower() for x in v] if isinstance(v, list) else [str(v).lower()]
+                return cleaned, p_tokens, c_tokens
+                
+        except Exception as e:
+            print(f"[LLM ERROR] Exception during override call: {e}")
+            
+        return self.active_slots, 0, 0
 
-    def update_state(self, user_message: str, turn: int) -> Dict[str, List[str]]:
-        """Updates slot state via fast regex or LLM override depending on pivot language."""
-        has_pivot = bool(PIVOT_TRIGGERS.search(user_message))
+    def update_state(self, user_message: str, turn: int) -> Tuple[Dict[str, List[str]], int, int]:
+        """Updates slot state: LLM override on pivot keywords, accumulation on regular turns."""
+        clean_msg = user_message.lower().strip()
+        has_pivot = bool(PIVOT_TRIGGERS.search(clean_msg))
         
-        if has_pivot and turn > 1:
-            # Route to LLM to clear/replace invalidated constraints
-            self.active_slots = self._run_llm_override(user_message)
-        else:
-            # Happy path: Fast regex accumulation
-            new_slots = self.extract_slots_regex(user_message)
-            for key, val in new_slots.items():
-                if key in self.active_slots:
-                    self.active_slots[key] = list(set(self.active_slots[key] + val))
-                else:
-                    self.active_slots[key] = val
+        # 1. Pivot Path (LLM resolves conflicts/deletions)
+        if has_pivot and turn >= 2:
+            new_slots, p_tokens, c_tokens = self._run_llm_override(user_message)
+            self.active_slots = new_slots
+            # NOTE: Removed self.asked_attributes overwrite to prevent locking out future clarification turns
+            return self.active_slots, p_tokens, c_tokens
 
-        return self.active_slots
+        # 2. Non-Pivot Path (Accumulate active slots without destructive assignment)
+        new_slots = self.extract_slots_regex(clean_msg)
+        for key, vals in new_slots.items():
+            if key in self.active_slots:
+                # Merge unique values to preserve history across turns
+                merged = list(dict.fromkeys(self.active_slots[key] + vals))
+                self.active_slots[key] = merged
+            else:
+                self.active_slots[key] = vals
+
+        return self.active_slots, 0, 0
 
     def get_next_ask_attribute(self) -> Optional[str]:
         """Determines the next unasked attribute for local_evaluator customer_reply alignment."""
@@ -134,12 +198,16 @@ Output JSON:"""
             if attr not in self.active_slots and attr not in self.asked_attributes:
                 self.asked_attributes.add(attr)
                 return attr
-        return "feature"
+        return None
 
     def build_search_query(self, category: str) -> str:
-        """Flattens active slots into an optimized candidate search string."""
-        terms = [category]
-        for key, values in self.active_slots.items():
-            if values:
-                terms.extend(values)
-        return " ".join(terms).strip()
+        """Constructs an optimized BM25 query prioritising high-precision attributes."""
+        terms = [category] if category else []
+        
+        # High-precision core keys first
+        for key in ["category", "material", "color", "size", "style", "brand", "budget", "feature", "use_case", "other", None]:
+            if key in self.active_slots:
+                terms.extend(self.active_slots[key])
+                
+        query = " ".join(terms).strip()
+        return query if query else category

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import re
@@ -19,7 +17,7 @@ if hf_token:
 
 from sentence_transformers import SentenceTransformer
 from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
-from starter.state_tracker import DialogueStateTracker  # Import dialogue state tracker
+from starter.state_tracker_rulebased import DialogueStateTracker  # Import rule-based dialogue state tracker
 
 # Allowed attributes defined by the evaluator
 ALLOWED_ATTRIBUTES = {
@@ -34,7 +32,7 @@ DEPARTMENT_PATTERN = re.compile(r"\b(men'?s|women'?s|kids'|unisex|baby)\b", re.I
 
 COLOR_VOCAB = {"black", "white", "blue", "red", "green", "yellow", "brown", "pink", "purple", "grey", "gray", "silver", "gold"}
 MATERIAL_VOCAB = {"leather", "cotton", "wool", "polyester", "silk", "nylon", "spandex", "denim", "canvas", "mesh"}
-BUYING_VERBS = {"buy", "purchase", "order", "need", "find", "get"}
+BUYING_VERBS = {"buy", "purchase", "order", "need", "find", "get", "checkout", "add"}
 BROWSING_SIGNALS = {"looking for", "exploring", "suggestions", "ideas", "recommend", "what should i", "something for", "gift", "options"}
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -131,28 +129,43 @@ class Agent:
         self.state_tracker.reset(user_profile)
         
     def _detect_intent(self, user_message: str, active_slots: Dict[str, Any]) -> str:
+        """
+        Dynamically detects user turn intent ('Buying' vs 'Browsing').
+        Evaluates regex rules, keyword vocabs, and slot-state density on every turn.
+        """
         text = user_message.lower()
-        detected_attributes = len(active_slots)
 
+        # Count total active constraints currently present in state
+        filled_slots_count = sum(1 for k, v in active_slots.items() if v)
+
+        # Detect specific regex attributes in the current message
+        message_attribute_signals = 0
         if PRICE_PATTERN.search(text):
-            detected_attributes += 1
+            message_attribute_signals += 1
         if SIZE_PATTERN.search(text):
-            detected_attributes += 1
+            message_attribute_signals += 1
         if DEPARTMENT_PATTERN.search(text):
-            detected_attributes += 1
+            message_attribute_signals += 1
 
         tokens = set(re.findall(r"\w+", text))
         if tokens & COLOR_VOCAB:
-            detected_attributes += 1
+            message_attribute_signals += 1
         if tokens & MATERIAL_VOCAB:
-            detected_attributes += 1
+            message_attribute_signals += 1
 
         has_browsing_phrases = any(phrase in text for phrase in BROWSING_SIGNALS)
         has_buying_verbs = any(verb in tokens for verb in BUYING_VERBS)
 
-        if has_browsing_phrases and detected_attributes < 2:
+        # 1. Override: Browsing phrases explicitly indicate discovery unless strong constraints exist
+        if has_browsing_phrases and (filled_slots_count + message_attribute_signals) < 3:
             return "Browsing"
-        if detected_attributes >= 2 or (has_buying_verbs and detected_attributes >= 1):
+
+        # 2. Buying Criteria: Direct buying verbs or high cumulative attribute density (>=2 attributes)
+        if (
+            has_buying_verbs 
+            or (filled_slots_count + message_attribute_signals) >= 2 
+            or message_attribute_signals >= 2
+        ):
             return "Buying"
 
         return "Browsing"
@@ -221,55 +234,91 @@ class Agent:
         )
         return [asin for asin, _ in sorted_candidates]
 
-    def _execute_hybrid_search(self, query: str, top_k: int = 10) -> List[str]:
-        """Executes BM25 and FAISS vector retrieval and fuses results using CombMNZ."""
+    def _buying_pipeline(self, query: str, top_k: int) -> List[str]:
+        """
+        Buying Pipeline: Focuses on precision and exact keyword/attribute matches.
+        Gives high weight to sparse BM25 indexing.
+        """
         candidate_pool_size = max(top_k * 5, 50)
-        
-        # 1. Sparse BM25 Search
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
-        
-        # 2. Dense FAISS Vector Search
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
-        
-        # 3. CombMNZ Fusion Reranking
-        fused_asins = self._combmnz_fusion(
+
+        # Sparse-heavy weights (BM25: 2.5, Dense FAISS: 0.8)
+        return self._combmnz_fusion(
             bm25_results=bm25_results,
             faiss_results=faiss_results,
-            weights=(1.0, 1.0)
-        )
-        
-        # Return top_k candidate parent_asin strings
-        return fused_asins[:top_k]
+            weights=(2.5, 0.8)
+        )[:top_k]
+
+    def _browsing_pipeline(self, query: str, top_k: int) -> List[str]:
+        """
+        Browsing Pipeline: Focuses on semantic diversity and stylistic exploration.
+        Gives high weight to dense vector FAISS search.
+        """
+        candidate_pool_size = max(top_k * 5, 50)
+        bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
+        faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
+
+        # Dense-heavy weights (BM25: 0.8, Dense FAISS: 1.8)
+        return self._combmnz_fusion(
+            bm25_results=bm25_results,
+            faiss_results=faiss_results,
+            weights=(0.8, 1.8)
+        )[:top_k]
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
         """
-        Handles dialogue turn:
-        1. Updates slot state (Regex on happy path, 8B LLM on pivot triggers).
-        2. Determines the next attribute to ask (populates ask_attribute).
-        3. Formulates an updated search query from active slots.
-        4. Returns recommendations, clarifying message, and usage stats.
+        Handles dialogue turn cleanly:
+        1. Updates slot state via state tracker.
+        2. Re-detects turn intent (Buying vs Browsing) dynamically.
+        3. Formulates structured search query.
+        4. Routes query to either Buying or Browsing retrieval pipeline.
+        5. Validates candidate parent ASINs and returns response dictionary.
         """
         # 1. Update slots via DialogueStateTracker
-        active_slots = self.state_tracker.update_state(user_message, turn)
+        active_slots, p_tokens, c_tokens = self.state_tracker.update_state(user_message, turn)
 
-        # 2. Select next unasked attribute for evaluator clarification loop
-        ask_attr = self.state_tracker.get_next_ask_attribute()
+        # 2. Re-detect intent dynamically based on updated active_slots and turn message
+        intent = self._detect_intent(user_message, active_slots)
 
-        # 3. Construct flattened search query using category & slots
+        # 3. Formulate search query
         category_list = active_slots.get("category", [])
         category = category_list[0] if category_list else ""
-        search_query = self.state_tracker.build_search_query(category) if category else user_message
+        
+        slot_query = self.state_tracker.build_search_query(category)
 
-        # 4. Fetch recommendations immediately to maximize Hit@10 / early-turn conversion
-        recommendations = self._execute_hybrid_search(search_query, top_k)
+        # Combine user message and slot query safely
+        if slot_query and slot_query.lower() not in user_message.lower():
+            search_query = f"{user_message} {slot_query}".strip()
+        else:
+            search_query = user_message
 
-        # 5. Build standard response dictionary expected by local_evaluator.py
+        # 4. Route candidate retrieval based on detected turn intent
+        if intent == "Buying":
+            raw_recommendations = self._buying_pipeline(search_query, top_k=top_k * 5)
+        else:
+            raw_recommendations = self._browsing_pipeline(search_query, top_k=top_k * 5)
+
+        # 5. Strict order-preserving deduplication & catalog validation
+        seen = set()
+        recommendations = []
+        for asin in raw_recommendations:
+            if asin not in seen and asin in self.parent_asins:
+                seen.add(asin)
+                recommendations.append(asin)
+                if len(recommendations) == top_k:
+                    break
+
+        # 6. Select next unasked attribute for evaluator clarification loop
+        ask_attr = self.state_tracker.get_next_ask_attribute()
+
+        # 7. Return payload expected by evaluator
         return {
             "message": f"Got it. What are your preferences for {ask_attr}?",
             "ask_attribute": ask_attr,
             "recommendations": recommendations,
             "usage": {
-                "prompt_tokens": 0,      # Populate if LLM override was triggered
-                "completion_tokens": 0,
+                "prompt_tokens": p_tokens,
+                "completion_tokens": c_tokens,
             },
         }
