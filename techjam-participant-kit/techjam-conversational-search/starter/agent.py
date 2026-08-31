@@ -15,7 +15,7 @@ if hf_token:
     os.environ["HF_TOKEN"] = hf_token
     os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
 from starter.indexer import _clean_text  # Import text cleaning utility
 from starter.state_tracker_rulebased import DialogueStateTracker  # Import rule-based dialogue state tracker
@@ -82,6 +82,10 @@ class Agent:
         self.encoder = SentenceTransformer(
             embedding_model, 
             token=hf_token if hf_token else None
+        )
+        self.cross_encoder = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            token=hf_token if hf_token else None,
         )
 
         # 2. Build Sparse BM25 Index in SQLite FTS5
@@ -326,7 +330,6 @@ class Agent:
     def _field_terms(self, product: dict, field: str) -> set[str]:
         return set(_terms(_clean_text(product.get(field))))
 
-
     def _rerank_candidates(self, query: str, candidates: List[str], bm25_results: List[Tuple[str, float]], faiss_results: List[Tuple[str, float]], intent: str,
     ) -> List[str]:
         """Reranks retrieved candidates using retrieval and constraint-coverage signals."""
@@ -450,6 +453,85 @@ class Agent:
         scored.sort(key=lambda item: item[1], reverse=True)
         return [asin for asin, _ in scored]
 
+    ## Cross-Encoder for final re-ranking of top candidates before getting top 10.
+    def _cross_encoder_text(self, product: Dict[str, Any]) -> str:
+        """Compact product representation for semantic cross-encoder scoring."""
+        title = _clean_text(product.get("title"))
+        categories = _clean_text(product.get("categories"))
+        features = _clean_text(product.get("features"))
+        store = _clean_text(product.get("store"))
+
+        return (
+            f"Title: {title}. "
+            f"Category: {categories}. "
+            f"Brand: {store}. "
+            f"Features: {features}"
+        )
+
+    def _cross_encoder_rerank(
+        self,
+        query: str,
+        ranked_candidates: List[str],
+        rerank_k: int = 30,
+        semantic_weight: float = 0.35,
+    ) -> List[str]:
+        """
+        Semantically reranks the strongest candidates while preserving the
+        deterministic reranker's existing ranking signal.
+        """
+        if not ranked_candidates:
+            return []
+
+        head = ranked_candidates[:rerank_k]
+        tail = ranked_candidates[rerank_k:]
+
+        pairs = [
+            (
+                query,
+                self._cross_encoder_text(
+                    self.products_by_asin.get(asin, {})
+                ),
+            )
+            for asin in head
+        ]
+
+        scores = np.asarray(
+            self.cross_encoder.predict(
+                pairs,
+                show_progress_bar=False,
+            ),
+            dtype=float,
+        )
+
+        # Normalize semantic scores.
+        if len(scores) > 1 and scores.max() != scores.min():
+            semantic_scores = (
+                (scores - scores.min())
+                / (scores.max() - scores.min())
+            )
+        else:
+            semantic_scores = np.ones(len(scores))
+
+        combined = []
+
+        for rank, (asin, semantic_score) in enumerate(
+            zip(head, semantic_scores),
+            start=1,
+        ):
+            # Existing reranker position converted into [roughly] 0–1 relevance.
+            existing_score = 1.0 / rank
+
+            score = (
+                (1.0 - semantic_weight) * existing_score
+                + semantic_weight * float(semantic_score)
+            )
+
+            combined.append((asin, score))
+
+        combined.sort(key=lambda item: item[1], reverse=True)
+
+        return [asin for asin, _ in combined] + tail
+
     def _buying_pipeline(
         self,
         query: str,
@@ -486,6 +568,13 @@ class Agent:
             bm25_results,
             faiss_results,
             intent="Buying",
+        )
+
+        reranked = self._cross_encoder_rerank(
+            rerank_query or query,
+            reranked,
+            rerank_k=30,
+            semantic_weight=0.35,
         )
 
         return reranked[:top_k], candidates, bm25_results, faiss_results
@@ -528,7 +617,15 @@ class Agent:
             intent="Browsing",
         )
 
+        reranked = self._cross_encoder_rerank(
+            rerank_query or query,
+            reranked,
+            rerank_k=30,
+            semantic_weight=0.35,
+        )
+
         return reranked[:top_k], candidates, bm25_results, faiss_results
+
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
         """
