@@ -19,6 +19,7 @@ from sentence_transformers import SentenceTransformer
 from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
 from starter.indexer import _clean_text  # Import text cleaning utility
 from starter.state_tracker_rulebased import DialogueStateTracker  # Import rule-based dialogue state tracker
+from starter.clarification_policy import ClarificationPolicy
 
 # Allowed attributes defined by the evaluator
 ALLOWED_ATTRIBUTES = {
@@ -64,6 +65,7 @@ class Agent:
         self.parent_asins: List[str] = []
         self.products_by_asin: Dict[str, Dict[str, Any]] = {}
         self.state_tracker = DialogueStateTracker()
+        self.clarification_policy = ClarificationPolicy()
 
         # 1. Load Model Encoder
         self.encoder = SentenceTransformer(
@@ -237,7 +239,7 @@ class Agent:
         )
         return [asin for asin, _ in sorted_candidates]
 
-    def _candidate_union(self, fused: List[str], bm25_results: List[Tuple[str, float]], faiss_results: List[Tuple[str, float]], fusion_k: int = 50, bm25_k: int = 50, faiss_k: int = 25,) -> List[str]:
+    def _candidate_union(self, fused: List[str], bm25_results: List[Tuple[str, float]], faiss_results: List[Tuple[str, float]], fusion_k: int = 100, bm25_k: int = 150, faiss_k: int = 75,) -> List[str]:
         """Preserves strong candidates from fusion and individual retrievers."""
         candidates, seen = [], set()
 
@@ -246,7 +248,7 @@ class Agent:
             [asin for asin, _ in bm25_results[:bm25_k]],
             [asin for asin, _ in faiss_results[:faiss_k]],
         ]
-
+    
         for source in sources:
             for asin in source:
                 if asin not in seen:
@@ -260,22 +262,19 @@ class Agent:
         return set(_terms(_clean_text(product.get(field))))
 
 
-    def _rerank_candidates(
-        self,
-        query: str,
-        candidates: List[str],
-        bm25_results: List[Tuple[str, float]],
-        faiss_results: List[Tuple[str, float]],
-        intent: str,
+    def _rerank_candidates(self, query: str, candidates: List[str], bm25_results: List[Tuple[str, float]], faiss_results: List[Tuple[str, float]], intent: str,
     ) -> List[str]:
         """Reranks retrieved candidates using retrieval and constraint-coverage signals."""
         if not candidates:
             return []
 
         query_terms = set(_terms(query))
+        query_term_list = _terms(query)
+        query_bigrams = set(zip(query_term_list, query_term_list[1:]))
+        query_trigrams = set(zip(query_term_list, query_term_list[1:], query_term_list[2:]))
+
         bm25_scores = dict(bm25_results)
         faiss_scores = dict(faiss_results)
-
         norm_bm25 = self._min_max_scale(bm25_scores)
         norm_faiss = self._min_max_scale(faiss_scores)
 
@@ -307,48 +306,67 @@ class Agent:
             else:
                 overall_coverage = title_coverage = category_coverage = feature_coverage = 0.0
 
+            # Phrase-level matching: rewards consecutive query terms appearing together in the product instead of only matching individual words.
+            product_text = " ".join([_clean_text(product.get("title")),_clean_text(product.get("categories")),_clean_text(product.get("features")),_clean_text(product.get("details")),_clean_text(product.get("description")),_clean_text(product.get("store")),])
+
+            product_term_list = _terms(product_text)
+            product_bigrams = set(zip(product_term_list, product_term_list[1:]))
+            product_trigrams = set(zip(product_term_list, product_term_list[1:], product_term_list[2:]))
+
+            bigram_coverage = (
+                len(query_bigrams & product_bigrams) / len(query_bigrams)
+                if query_bigrams else 0.0
+            )
+
+            trigram_coverage = (
+                len(query_trigrams & product_trigrams) / len(query_trigrams)
+                if query_trigrams else 0.0
+            )
+
             bm25_score = norm_bm25.get(asin, 0.0)
             dense_score = norm_faiss.get(asin, 0.0)
 
             # Smooth rank signals in [0, 1].
             bm25_rank_score = 1.0 / bm25_ranks[asin] if asin in bm25_ranks else 0.0
             dense_rank_score = 1.0 / faiss_ranks[asin] if asin in faiss_ranks else 0.0
-
             both_bonus = 1.0 if asin in bm25_scores and asin in faiss_scores else 0.0
 
             if intent == "Buying":
                 score = (
-                    2.20 * bm25_score + 0.65 * dense_score + 1.40 * overall_coverage + 0.70 * title_coverage + 0.45 * category_coverage + 0.60 * feature_coverage + 0.20 * bm25_rank_score + 0.05 * dense_rank_score + 0.15 * both_bonus)
+                    2.20 * bm25_score + 0.65 * dense_score + 1.40 * overall_coverage + 0.70 * title_coverage + 0.45 * category_coverage + 0.60 * feature_coverage + 0.50 * bigram_coverage + 0.25 * trigram_coverage + 0.20 * bm25_rank_score + 0.05 * dense_rank_score + 0.15 * both_bonus)
             else:
                 score = (
-                    1.30 * bm25_score+ 1.00 * dense_score + 1.20 * overall_coverage + 0.55 * title_coverage + 0.35 * category_coverage + 0.55 * feature_coverage + 0.10 * bm25_rank_score + 0.10 * dense_rank_score + 0.15 * both_bonus)
+                    1.30 * bm25_score+ 1.00 * dense_score + 1.20 * overall_coverage + 0.55 * title_coverage + 0.35 * category_coverage + 0.55 * feature_coverage + 0.35 * bigram_coverage + 0.20 * trigram_coverage + 0.10 * bm25_rank_score + 0.10 * dense_rank_score + 0.15 * both_bonus)
 
             scored.append((asin, score))
 
         scored.sort(key=lambda item: item[1], reverse=True)
         return [asin for asin, _ in scored]
 
-    def _buying_pipeline(self, query: str, top_k: int, rerank_query: str = "") -> List[str]:
+    def _buying_pipeline(self, query: str, top_k: int, rerank_query: str = "") -> Tuple[List[str],List[str],List[Tuple[str, float]],List[Tuple[str, float]],]:
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
         fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(2.5, 0.8),)
 
-        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=50,bm25_k=50,faiss_k=25,)
+        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=100,bm25_k=150,faiss_k=75,)
 
-        return self._rerank_candidates(rerank_query or query,  candidates, bm25_results, faiss_results, intent="Buying",)[:top_k]
+        reranked = self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results,intent="Buying",)
 
-    def _browsing_pipeline(self, query: str, top_k: int, rerank_query: str = "",) -> List[str]:
+        return reranked[:top_k], candidates, bm25_results, faiss_results
+
+    def _browsing_pipeline(self, query: str, top_k: int, rerank_query: str = "",) -> Tuple[List[str],List[str],List[Tuple[str, float]],List[Tuple[str, float]],]:
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
         fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(1.4, 1.0),)
 
-        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=50,bm25_k=50,faiss_k=25,)
+        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=100,bm25_k=150,faiss_k=75,)
 
-        return self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results, intent="Browsing",)[:top_k]
+        reranked = self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results, intent="Browsing",)
+        return reranked[:top_k], candidates, bm25_results, faiss_results
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
         """
@@ -380,9 +398,9 @@ class Agent:
         # 4. Route candidate retrieval based on detected turn intent
         rerank_query = slot_query if len(_terms(slot_query)) >= 2 else search_query
         if intent == "Buying":
-            raw_recommendations = self._buying_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
+            raw_recommendations, candidates, bm25_results, faiss_results = self._buying_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
         else:
-            raw_recommendations = self._browsing_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
+            raw_recommendations, candidates, bm25_results, faiss_results = self._browsing_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
 
         # 5. Strict order-preserving deduplication & catalog validation
         seen = set()
@@ -395,7 +413,24 @@ class Agent:
                     break
 
         # 6. Select next unasked attribute for evaluator clarification loop
-        ask_attr = self.state_tracker.get_next_ask_attribute()
+        should_clarify, candidate_attr = self.clarification_policy.decide(
+            turn=turn,
+            active_slots=active_slots,
+            candidates=candidates,
+            products_by_asin=self.products_by_asin,
+            bm25_results=bm25_results,
+            faiss_results=faiss_results,
+            asked_attributes=self.state_tracker.asked_attributes,
+            no_preference_attributes=self.state_tracker.no_preference_attributes,
+        )
+
+        if should_clarify and candidate_attr:
+            ask_attr = candidate_attr
+            self.state_tracker.asked_attributes.add(ask_attr)
+            self.state_tracker.expected_attribute = ask_attr
+        else:
+            ask_attr = self.state_tracker.get_next_ask_attribute()
+
         if ask_attr:
             message = f"Got it. What are your preferences for {ask_attr}?"
         else:
