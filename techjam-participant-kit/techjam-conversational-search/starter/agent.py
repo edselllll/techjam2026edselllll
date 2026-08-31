@@ -53,6 +53,12 @@ def _terms(text: str) -> list[str]:
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
 
+def _normalize_category(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s-]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
 
 class Agent:
     def __init__(
@@ -172,6 +178,67 @@ class Agent:
             return "Buying"
 
         return "Browsing"
+
+    def _category_path(self, product: dict) -> List[str]:
+        categories = product.get("categories", [])
+        if not isinstance(categories, list):
+            return []
+
+        return [
+            _normalize_category(str(category))
+            for category in categories
+            if category
+        ]
+
+
+    def _category_hierarchy_score(
+        self,
+        product: dict,
+        active_slots: Dict[str, List[str]],
+    ) -> float:
+        """
+        Scores agreement between the session category and the product's
+        hierarchical Amazon category path.
+
+        Deeper category matches receive more weight than broad parent matches.
+        """
+        query_categories = active_slots.get("category", [])
+        product_path = self._category_path(product)
+
+        if not query_categories or not product_path:
+            return 0.0
+
+        best_score = 0.0
+        path_length = len(product_path)
+
+        for query_category in query_categories:
+            query = _normalize_category(query_category)
+            query_terms = set(_terms(query))
+
+            if not query_terms:
+                continue
+
+            for depth, category in enumerate(product_path):
+                category_terms = set(_terms(category))
+
+                if not category_terms:
+                    continue
+
+                # Exact category-name match.
+                if query == category:
+                    match_score = 1.0
+                else:
+                    match_score = (
+                        len(query_terms & category_terms) / len(query_terms)
+                    )
+
+                # Deeper nodes are more specific and therefore more useful.
+                depth_weight = (depth + 1) / path_length
+                score = match_score * (0.5 + 0.5 * depth_weight)
+
+                best_score = max(best_score, score)
+
+        return best_score
 
     def _search_bm25(self, query: str, top_k: int = 50) -> List[Tuple[str, float]]:
         """Executes BM25 search returning (asin, raw_bm25_score) pairs."""
@@ -314,6 +381,12 @@ class Agent:
                 if profile_terms else 0.0
             )
 
+            ## Compute category hierarchy score for the product based on active slots
+            category_hierarchy_score = self._category_hierarchy_score(
+                product,
+                self.state_tracker.active_slots,
+            )
+
             ## Compute coverage metrics for query terms
             if query_terms:
                 overall_coverage = len(query_terms & all_terms) / len(query_terms)
@@ -358,6 +431,7 @@ class Agent:
                     + 0.20 * bm25_rank_score + 0.05 * dense_rank_score
                     + 0.15 * both_bonus
                     + 0.08 * profile_coverage + 0.06 * profile_feature_coverage + 0.04 * profile_title_coverage
+                    + 0.30 * category_hierarchy_score
                 )
             else:
                 score = (
@@ -368,6 +442,7 @@ class Agent:
                     + 0.10 * bm25_rank_score + 0.10 * dense_rank_score
                     + 0.15 * both_bonus
                     + 0.12 * profile_coverage + 0.08 * profile_feature_coverage + 0.05 * profile_title_coverage
+                    + 0.18 * category_hierarchy_score
                 )
 
             scored.append((asin, score))
