@@ -66,6 +66,9 @@ class Agent:
         self.products_by_asin: Dict[str, Dict[str, Any]] = {}
         self.state_tracker = DialogueStateTracker()
         self.clarification_policy = ClarificationPolicy()
+        # for profile reading 
+        self.user_profile: Dict[str, Any] = {}
+        self.profile_terms: set[str] = set()
 
         # 1. Load Model Encoder
         self.encoder = SentenceTransformer(
@@ -106,20 +109,8 @@ class Agent:
                 description = _clean_text(product.get("description"))
                 store = _clean_text(product.get("store"))
 
-                embed_text = (
-                    f"Product: {title}. "
-                    f"Category: {cats}. "
-                    f"Brand: {store}. "
-                    f"Features: {feats}. "
-                    f"Details: {details}. "
-                    f"Description: {description}."
-                ).strip()
-
                 self.parent_asins.append(asin)
                 bm25_batch.append((asin, title, cats, feats, details, store, description))
-                
-                # embed_text = f"{title}. Category: {cats}. Features: {feats}".strip()
-                # documents_to_embed.append(embed_text)
 
                 if len(bm25_batch) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", bm25_batch)
@@ -130,8 +121,13 @@ class Agent:
         self.connection.commit()
 
     def reset(self, session_id: str, user_profile: Optional[dict] = None) -> None:
-        """Resets agent state per session and loads user profile preferences."""
+        self.user_profile = user_profile or {}
         self.state_tracker.reset(user_profile)
+
+        tags = self.user_profile.get("preference_tags", [])
+        self.profile_terms = set(
+            _terms(" ".join(str(tag) for tag in tags))
+        )
         
     def _detect_intent(self, user_message: str, active_slots: Dict[str, Any]) -> str:
         """
@@ -269,6 +265,8 @@ class Agent:
             return []
 
         query_terms = set(_terms(query))
+        profile_terms = self.profile_terms
+
         query_term_list = _terms(query)
         query_bigrams = set(zip(query_term_list, query_term_list[1:]))
         query_trigrams = set(zip(query_term_list, query_term_list[1:], query_term_list[2:]))
@@ -298,6 +296,23 @@ class Agent:
                 detail_terms | description_terms | store_terms
             )
 
+            ## Compute coverage metrics for profile terms
+            profile_coverage = (
+                len(profile_terms & all_terms) / len(profile_terms)
+                if profile_terms else 0.0
+            )
+
+            profile_feature_coverage = (
+                len(profile_terms & feature_terms) / len(profile_terms)
+                if profile_terms else 0.0
+            )
+
+            profile_title_coverage = (
+                len(profile_terms & title_terms) / len(profile_terms)
+                if profile_terms else 0.0
+            )
+
+            ## Compute coverage metrics for query terms
             if query_terms:
                 overall_coverage = len(query_terms & all_terms) / len(query_terms)
                 title_coverage = len(query_terms & title_terms) / len(query_terms)
@@ -313,6 +328,7 @@ class Agent:
             product_bigrams = set(zip(product_term_list, product_term_list[1:]))
             product_trigrams = set(zip(product_term_list, product_term_list[1:], product_term_list[2:]))
 
+            # Compute bigram and trigram coverage for query terms
             bigram_coverage = (
                 len(query_bigrams & product_bigrams) / len(query_bigrams)
                 if query_bigrams else 0.0
@@ -333,10 +349,24 @@ class Agent:
 
             if intent == "Buying":
                 score = (
-                    2.20 * bm25_score + 0.65 * dense_score + 1.40 * overall_coverage + 0.70 * title_coverage + 0.45 * category_coverage + 0.60 * feature_coverage + 0.50 * bigram_coverage + 0.25 * trigram_coverage + 0.20 * bm25_rank_score + 0.05 * dense_rank_score + 0.15 * both_bonus)
+                    2.20 * bm25_score + 0.65 * dense_score
+                    + 1.40 * overall_coverage
+                    + 0.70 * title_coverage + 0.45 * category_coverage + 0.60 * feature_coverage
+                    + 0.50 * bigram_coverage + 0.25 * trigram_coverage
+                    + 0.20 * bm25_rank_score + 0.05 * dense_rank_score
+                    + 0.15 * both_bonus
+                    + 0.08 * profile_coverage + 0.06 * profile_feature_coverage + 0.04 * profile_title_coverage
+                )
             else:
                 score = (
-                    1.30 * bm25_score+ 1.00 * dense_score + 1.20 * overall_coverage + 0.55 * title_coverage + 0.35 * category_coverage + 0.55 * feature_coverage + 0.35 * bigram_coverage + 0.20 * trigram_coverage + 0.10 * bm25_rank_score + 0.10 * dense_rank_score + 0.15 * both_bonus)
+                    1.30 * bm25_score + 1.00 * dense_score
+                    + 1.20 * overall_coverage
+                    + 0.55 * title_coverage + 0.35 * category_coverage + 0.55 * feature_coverage
+                    + 0.35 * bigram_coverage + 0.20 * trigram_coverage
+                    + 0.10 * bm25_rank_score + 0.10 * dense_rank_score
+                    + 0.15 * both_bonus
+                    + 0.12 * profile_coverage + 0.08 * profile_feature_coverage + 0.05 * profile_title_coverage
+                )
 
             scored.append((asin, score))
 

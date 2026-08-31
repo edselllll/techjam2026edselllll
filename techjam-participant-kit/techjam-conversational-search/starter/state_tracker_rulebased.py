@@ -126,10 +126,13 @@ class DialogueStateTracker:
         values = list(dict.fromkeys(self._clean(v) for v in values if self._clean(v)))
         if not values:
             return
+
         if replace or slot in SINGLE_VALUE_SLOTS:
             self.active_slots[slot] = [values[-1]]
         else:
-            self.active_slots[slot] = list(dict.fromkeys(self.active_slots.get(slot, []) + values))
+            self.active_slots[slot] = list(
+                dict.fromkeys(self.active_slots.get(slot, []) + values)
+            )
 
     def extract_slots_regex(self, text: str) -> Dict[str, List[str]]:
         extracted: Dict[str, List[str]] = {}
