@@ -17,6 +17,7 @@ if hf_token:
 
 from sentence_transformers import SentenceTransformer
 from starter.indexer import CatalogIndexer  # Import modular FAISS indexer
+from starter.indexer import _clean_text  # Import text cleaning utility
 from starter.state_tracker_rulebased import DialogueStateTracker  # Import rule-based dialogue state tracker
 
 # Allowed attributes defined by the evaluator
@@ -43,16 +44,6 @@ STOPWORDS = {
 }
 
 
-def _text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        return " ".join(f"{k} {v}" for k, v in value.items() if v)
-    if isinstance(value, list):
-        return " ".join(str(item) for item in value if item)
-    return str(value)
-
-
 def _terms(text: str) -> list[str]:
     return [
         token.lower()
@@ -71,6 +62,7 @@ class Agent:
         self.connection = sqlite3.connect(":memory:")
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self.parent_asins: List[str] = []
+        self.products_by_asin: Dict[str, Dict[str, Any]] = {}
         self.state_tracker = DialogueStateTracker()
 
         # 1. Load Model Encoder
@@ -81,6 +73,7 @@ class Agent:
 
         # 2. Build Sparse BM25 Index in SQLite FTS5
         self._build_bm25_index()
+        
 
         # 3. Instantiate Modular FAISS Indexer
         self.vector_indexer = CatalogIndexer(
@@ -96,25 +89,35 @@ class Agent:
             "tokenize='unicode61 remove_diacritics 2')"
         )
         bm25_batch: List[Tuple[str, str, str, str, str, str, str]] = []
-        documents_to_embed: List[str] = []
+        # documents_to_embed: List[str] = []
         
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
                 asin = str(product["parent_asin"])
+                self.products_by_asin[asin] = product
                 
-                title = _text(product.get("title"))
-                cats = _text(product.get("categories"))
-                feats = _text(product.get("features"))
-                dets = _text(product.get("details"))
-                store = _text(product.get("store"))
-                desc = _text(product.get("description"))
+                title = _clean_text(product.get("title"))
+                cats = _clean_text(product.get("categories"))
+                feats = _clean_text(product.get("features"))
+                details = _clean_text(product.get("details"))
+                description = _clean_text(product.get("description"))
+                store = _clean_text(product.get("store"))
+
+                embed_text = (
+                    f"Product: {title}. "
+                    f"Category: {cats}. "
+                    f"Brand: {store}. "
+                    f"Features: {feats}. "
+                    f"Details: {details}. "
+                    f"Description: {description}."
+                ).strip()
 
                 self.parent_asins.append(asin)
-                bm25_batch.append((asin, title, cats, feats, dets, store, desc))
+                bm25_batch.append((asin, title, cats, feats, details, store, description))
                 
-                embed_text = f"{title}. Category: {cats}. Features: {feats}".strip()
-                documents_to_embed.append(embed_text)
+                # embed_text = f"{title}. Category: {cats}. Features: {feats}".strip()
+                # documents_to_embed.append(embed_text)
 
                 if len(bm25_batch) >= 1000:
                     cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", bm25_batch)
@@ -234,37 +237,118 @@ class Agent:
         )
         return [asin for asin, _ in sorted_candidates]
 
-    def _buying_pipeline(self, query: str, top_k: int) -> List[str]:
-        """
-        Buying Pipeline: Focuses on precision and exact keyword/attribute matches.
-        Gives high weight to sparse BM25 indexing.
-        """
+    def _candidate_union(self, fused: List[str], bm25_results: List[Tuple[str, float]], faiss_results: List[Tuple[str, float]], fusion_k: int = 50, bm25_k: int = 50, faiss_k: int = 25,) -> List[str]:
+        """Preserves strong candidates from fusion and individual retrievers."""
+        candidates, seen = [], set()
+
+        sources = [
+            fused[:fusion_k],
+            [asin for asin, _ in bm25_results[:bm25_k]],
+            [asin for asin, _ in faiss_results[:faiss_k]],
+        ]
+
+        for source in sources:
+            for asin in source:
+                if asin not in seen:
+                    seen.add(asin)
+                    candidates.append(asin)
+
+        return candidates
+
+
+    def _field_terms(self, product: dict, field: str) -> set[str]:
+        return set(_terms(_clean_text(product.get(field))))
+
+
+    def _rerank_candidates(
+        self,
+        query: str,
+        candidates: List[str],
+        bm25_results: List[Tuple[str, float]],
+        faiss_results: List[Tuple[str, float]],
+        intent: str,
+    ) -> List[str]:
+        """Reranks retrieved candidates using retrieval and constraint-coverage signals."""
+        if not candidates:
+            return []
+
+        query_terms = set(_terms(query))
+        bm25_scores = dict(bm25_results)
+        faiss_scores = dict(faiss_results)
+
+        norm_bm25 = self._min_max_scale(bm25_scores)
+        norm_faiss = self._min_max_scale(faiss_scores)
+
+        bm25_ranks = {asin: rank for rank, (asin, _) in enumerate(bm25_results, 1)}
+        faiss_ranks = {asin: rank for rank, (asin, _) in enumerate(faiss_results, 1)}
+
+        scored = []
+
+        for asin in candidates:
+            product = self.products_by_asin.get(asin, {})
+
+            title_terms = self._field_terms(product, "title")
+            category_terms = self._field_terms(product, "categories")
+            feature_terms = self._field_terms(product, "features")
+            detail_terms = self._field_terms(product, "details")
+            description_terms = self._field_terms(product, "description")
+            store_terms = self._field_terms(product, "store")
+
+            all_terms = (
+                title_terms | category_terms | feature_terms |
+                detail_terms | description_terms | store_terms
+            )
+
+            if query_terms:
+                overall_coverage = len(query_terms & all_terms) / len(query_terms)
+                title_coverage = len(query_terms & title_terms) / len(query_terms)
+                category_coverage = len(query_terms & category_terms) / len(query_terms)
+                feature_coverage = len(query_terms & feature_terms) / len(query_terms)
+            else:
+                overall_coverage = title_coverage = category_coverage = feature_coverage = 0.0
+
+            bm25_score = norm_bm25.get(asin, 0.0)
+            dense_score = norm_faiss.get(asin, 0.0)
+
+            # Smooth rank signals in [0, 1].
+            bm25_rank_score = 1.0 / bm25_ranks[asin] if asin in bm25_ranks else 0.0
+            dense_rank_score = 1.0 / faiss_ranks[asin] if asin in faiss_ranks else 0.0
+
+            both_bonus = 1.0 if asin in bm25_scores and asin in faiss_scores else 0.0
+
+            if intent == "Buying":
+                score = (
+                    2.20 * bm25_score + 0.65 * dense_score + 1.40 * overall_coverage + 0.70 * title_coverage + 0.45 * category_coverage + 0.60 * feature_coverage + 0.20 * bm25_rank_score + 0.05 * dense_rank_score + 0.15 * both_bonus)
+            else:
+                score = (
+                    1.30 * bm25_score+ 1.00 * dense_score + 1.20 * overall_coverage + 0.55 * title_coverage + 0.35 * category_coverage + 0.55 * feature_coverage + 0.10 * bm25_rank_score + 0.10 * dense_rank_score + 0.15 * both_bonus)
+
+            scored.append((asin, score))
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return [asin for asin, _ in scored]
+
+    def _buying_pipeline(self, query: str, top_k: int, rerank_query: str = "") -> List[str]:
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
-        # Sparse-heavy weights (BM25: 2.5, Dense FAISS: 0.8)
-        return self._combmnz_fusion(
-            bm25_results=bm25_results,
-            faiss_results=faiss_results,
-            weights=(2.5, 0.8)
-        )[:top_k]
+        fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(2.5, 0.8),)
 
-    def _browsing_pipeline(self, query: str, top_k: int) -> List[str]:
-        """
-        Browsing Pipeline: Focuses on semantic diversity and stylistic exploration.
-        Gives high weight to dense vector FAISS search.
-        """
+        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=50,bm25_k=50,faiss_k=25,)
+
+        return self._rerank_candidates(rerank_query or query,  candidates, bm25_results, faiss_results, intent="Buying",)[:top_k]
+
+    def _browsing_pipeline(self, query: str, top_k: int, rerank_query: str = "",) -> List[str]:
         candidate_pool_size = max(top_k * 5, 50)
         bm25_results = self._search_bm25(query, top_k=candidate_pool_size)
         faiss_results = self.vector_indexer.search(query, top_k=candidate_pool_size)
 
-        # Dense-heavy weights (BM25: 0.8, Dense FAISS: 1.8)
-        return self._combmnz_fusion(
-            bm25_results=bm25_results,
-            faiss_results=faiss_results,
-            weights=(0.8, 1.8)
-        )[:top_k]
+        fused = self._combmnz_fusion(bm25_results,faiss_results,weights=(1.4, 1.0),)
+
+        candidates = self._candidate_union(fused,bm25_results,faiss_results,fusion_k=50,bm25_k=50,faiss_k=25,)
+
+        return self._rerank_candidates(rerank_query or query, candidates, bm25_results, faiss_results, intent="Browsing",)[:top_k]
 
     def respond(self, session_id: str, user_message: str, turn: int, top_k: int = 10) -> Dict[str, Any]:
         """
@@ -294,10 +378,11 @@ class Agent:
             search_query = user_message
 
         # 4. Route candidate retrieval based on detected turn intent
+        rerank_query = slot_query if len(_terms(slot_query)) >= 2 else search_query
         if intent == "Buying":
-            raw_recommendations = self._buying_pipeline(search_query, top_k=top_k * 5)
+            raw_recommendations = self._buying_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
         else:
-            raw_recommendations = self._browsing_pipeline(search_query, top_k=top_k * 5)
+            raw_recommendations = self._browsing_pipeline(search_query, top_k=top_k * 5, rerank_query=rerank_query)
 
         # 5. Strict order-preserving deduplication & catalog validation
         seen = set()

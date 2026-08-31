@@ -1,5 +1,5 @@
 import unittest
-from state_tracker_rulebased import DialogueStateTracker
+from starter.state_tracker_rulebased import DialogueStateTracker
 
 
 class TestDialogueStateTracker(unittest.TestCase):
